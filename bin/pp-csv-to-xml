@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Run the pinned Portfolio Performance incremental CSV-to-XML adapter."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+runtime_path = Path(__file__).with_name("pp-csv-engine-runtime")
+if not runtime_path.is_file():
+    runtime_path = Path(__file__).with_name("pp-prototype-cross-platform")
+RUNTIME = runpy.run_path(
+    str(runtime_path)
+)
+LauncherError = RUNTIME["LauncherError"]
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create or incrementally update a Portfolio Performance XML "
+            "using the pinned official model."
+        )
+    )
+    parser.add_argument("--csv", type=Path)
+    parser.add_argument("--existing", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--base-currency", default="")
+    parser.add_argument("--verify", type=Path)
+    parser.add_argument(
+        "--verify-import",
+        nargs=2,
+        type=Path,
+        metavar=("CSV", "XML"),
+    )
+    args = parser.parse_args(argv)
+    if (
+        args.verify is None
+        and args.verify_import is None
+        and (args.csv is None or args.output is None)
+    ):
+        parser.error("--csv and --output are required for create/update")
+    if args.verify is not None and (args.verify_import is not None or any(
+        item is not None for item in (args.csv, args.existing, args.output)
+    )):
+        parser.error("--verify cannot be combined with create/update arguments")
+    if args.verify_import is not None and any(
+        item is not None for item in (args.csv, args.existing, args.output, args.verify)
+    ):
+        parser.error("--verify-import cannot be combined with create/update arguments")
+    return args
+
+
+def prepare_runtime() -> tuple[Path, str]:
+    cache_dir = RUNTIME["CACHE_DIR"]
+    maven_repo = RUNTIME["MAVEN_REPO"]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    maven_repo.mkdir(parents=True, exist_ok=True)
+    java_home = RUNTIME["prepare_java"]()
+    _, maven = RUNTIME["prepare_maven"]()
+    RUNTIME["prepare_upstream"]()
+    RUNTIME["build_engine"](java_home, maven)
+    java = RUNTIME["executable"](java_home / "bin", "java")
+    return java, RUNTIME["runtime_classpath"]()
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        java, classpath = prepare_runtime()
+        command = [
+            str(java),
+            "-cp",
+            classpath,
+            "name.abuchen.portfolio.model.PortfolioCsvImportCli",
+        ]
+        if args.verify is not None:
+            command.extend(["--verify", str(args.verify.expanduser().resolve())])
+        elif args.verify_import is not None:
+            source, xml = args.verify_import
+            command.extend(
+                [
+                    "--verify-import",
+                    str(source.expanduser().resolve()),
+                    str(xml.expanduser().resolve()),
+                ]
+            )
+        else:
+            csv_path = args.csv.expanduser().resolve()
+            output = args.output.expanduser().resolve()
+            if not csv_path.is_file():
+                print(f"CSV file not found: {csv_path}", file=sys.stderr)
+                return 66
+            output.parent.mkdir(parents=True, exist_ok=True)
+            existing = "-"
+            if args.existing is not None:
+                existing_path = args.existing.expanduser().resolve()
+                if not existing_path.is_file():
+                    print(f"Existing XML file not found: {existing_path}", file=sys.stderr)
+                    return 66
+                existing = str(existing_path)
+            command.extend(
+                [
+                    "--apply",
+                    str(csv_path),
+                    existing,
+                    str(output),
+                    "--base-currency",
+                ]
+            )
+            if args.base_currency.strip():
+                command.append(args.base_currency.strip().upper())
+        return subprocess.run(command, check=False).returncode
+    except LauncherError as error:
+        print(f"Ошибка запуска Portfolio Performance: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

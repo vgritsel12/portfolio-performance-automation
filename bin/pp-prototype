@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE_COMMIT="2f3917512f4d042cc4dd2abcf24ae62d665f9b18"
+ENGINE_VERSION="0.86.1-SNAPSHOT"
+MAVEN_VERSION="3.9.11"
+CACHE_DIR="${PP_PROTOTYPE_CACHE_DIR:-$ROOT_DIR/.cache/pp-prototype}"
+UPSTREAM_DIR="${PP_UPSTREAM_DIR:-$CACHE_DIR/portfolio-$ENGINE_COMMIT}"
+MAVEN_REPO="${PP_MAVEN_REPO:-$CACHE_DIR/m2}"
+OVERLAY_SOURCE="$ROOT_DIR/upstream-overlay/name.abuchen.portfolio/src/name/abuchen/portfolio/cli/PortfolioPrototypeCli.java"
+UPSTREAM_SOURCE="$UPSTREAM_DIR/name.abuchen.portfolio/src/name/abuchen/portfolio/cli/PortfolioPrototypeCli.java"
+
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+    echo "Usage: $0 <input.xml> [output-directory] [comparison.xml]" >&2
+    exit 64
+fi
+
+INPUT_XML="$1"
+OUTPUT_DIR="${2:-$ROOT_DIR/output}"
+COMPARISON_XML="${3:-}"
+
+mkdir -p "$CACHE_DIR" "$MAVEN_REPO"
+
+java_major()
+{
+    "$1" -version 2>&1 | awk -F'[\".]' '/version/ { print $2; exit }'
+}
+
+system_java_home()
+{
+    "$1" -XshowSettings:properties -version 2>&1 \
+        | awk -F'= ' '/^[[:space:]]*java.home = / { print $2; exit }'
+}
+
+file_sha256()
+{
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
+
+prepare_java()
+{
+    if [[ -n "${PP_JAVA_HOME:-}" && -x "$PP_JAVA_HOME/bin/java" ]]; then
+        JAVA_HOME="$PP_JAVA_HOME"
+    elif command -v java >/dev/null 2>&1 && [[ "$(java_major "$(command -v java)")" == "21" ]]; then
+        JAVA_HOME="$(system_java_home "$(command -v java)")"
+    else
+        JAVA_HOME="$CACHE_DIR/jdk-21"
+        if [[ ! -x "$JAVA_HOME/bin/java" ]]; then
+            local os arch api archive unpacked
+            case "$(uname -s)" in
+                Darwin) os="mac" ;;
+                Linux) os="linux" ;;
+                *) echo "Automatic JDK setup supports macOS and Linux only." >&2; exit 69 ;;
+            esac
+            case "$(uname -m)" in
+                arm64|aarch64) arch="aarch64" ;;
+                x86_64|amd64) arch="x64" ;;
+                *) echo "Unsupported CPU architecture: $(uname -m)" >&2; exit 69 ;;
+            esac
+            api="https://api.adoptium.net/v3/binary/latest/21/ga/$os/$arch/jdk/hotspot/normal/eclipse"
+            archive="$(mktemp "$CACHE_DIR/jdk.XXXXXX.tar.gz")"
+            unpacked="$(mktemp -d "$CACHE_DIR/jdk.XXXXXX")"
+            echo "Downloading Eclipse Temurin JDK 21..." >&2
+            curl -fL --retry 3 "$api" -o "$archive"
+            tar -xzf "$archive" -C "$unpacked"
+            local detected
+            detected="$(find "$unpacked" -type f -path '*/bin/java' -print | head -1)"
+            if [[ -z "$detected" ]]; then
+                echo "Downloaded JDK archive does not contain bin/java." >&2
+                exit 69
+            fi
+            detected="$(cd "$(dirname "$detected")/.." && pwd)"
+            if [[ -e "$JAVA_HOME" ]]; then
+                echo "Incomplete cached JDK exists at $JAVA_HOME; remove that cache entry and retry." >&2
+                exit 69
+            fi
+            mv "$detected" "$JAVA_HOME"
+            rm -f "$archive"
+        fi
+    fi
+
+    if [[ "$(java_major "$JAVA_HOME/bin/java")" != "21" ]]; then
+        echo "Portfolio Performance requires Java 21; found $("$JAVA_HOME/bin/java" -version 2>&1 | head -1)." >&2
+        exit 69
+    fi
+    export JAVA_HOME
+}
+
+prepare_maven()
+{
+    if [[ -n "${PP_MAVEN_HOME:-}" && -x "$PP_MAVEN_HOME/bin/mvn" ]]; then
+        MAVEN_HOME="$PP_MAVEN_HOME"
+    elif command -v mvn >/dev/null 2>&1; then
+        MAVEN_HOME="$(cd "$(dirname "$(command -v mvn)")/.." && pwd)"
+    else
+        MAVEN_HOME="$CACHE_DIR/apache-maven-$MAVEN_VERSION"
+        if [[ ! -x "$MAVEN_HOME/bin/mvn" ]]; then
+            local archive
+            archive="$(mktemp "$CACHE_DIR/maven.XXXXXX.tar.gz")"
+            echo "Downloading Apache Maven $MAVEN_VERSION..." >&2
+            curl -fL --retry 3 \
+                "https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz" \
+                -o "$archive"
+            tar -xzf "$archive" -C "$CACHE_DIR"
+            rm -f "$archive"
+        fi
+    fi
+}
+
+prepare_upstream()
+{
+    if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
+        echo "Fetching Portfolio Performance commit $ENGINE_COMMIT..." >&2
+        git init -q "$UPSTREAM_DIR"
+        git -C "$UPSTREAM_DIR" remote add origin https://github.com/portfolio-performance/portfolio.git
+        git -C "$UPSTREAM_DIR" fetch -q --depth 1 origin "$ENGINE_COMMIT"
+        git -C "$UPSTREAM_DIR" checkout -q --detach FETCH_HEAD
+    fi
+
+    local actual_commit
+    actual_commit="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+    if [[ "$actual_commit" != "$ENGINE_COMMIT" ]]; then
+        echo "Cached upstream has unexpected commit: $actual_commit" >&2
+        exit 70
+    fi
+
+    mkdir -p "$(dirname "$UPSTREAM_SOURCE")"
+    if [[ ! -f "$UPSTREAM_SOURCE" ]] || ! cmp -s "$OVERLAY_SOURCE" "$UPSTREAM_SOURCE"; then
+        cp "$OVERLAY_SOURCE" "$UPSTREAM_SOURCE"
+    fi
+}
+
+build_engine()
+{
+    local overlay_hash marker core_jar
+    overlay_hash="$(file_sha256 "$OVERLAY_SOURCE")"
+    marker="$CACHE_DIR/build-$ENGINE_COMMIT-$overlay_hash.ok"
+    core_jar="$UPSTREAM_DIR/name.abuchen.portfolio/target/name.abuchen.portfolio-$ENGINE_VERSION.jar"
+
+    if [[ -f "$marker" && -f "$core_jar" ]] && \
+       "$JAVA_HOME/bin/jar" tf "$core_jar" | grep -q 'name/abuchen/portfolio/cli/PortfolioPrototypeCli.class'; then
+        return
+    fi
+
+    echo "Building the pinned Portfolio Performance core and CLI overlay..." >&2
+    "$MAVEN_HOME/bin/mvn" -q -f "$UPSTREAM_DIR/portfolio-app/pom.xml" \
+        -Dmaven.repo.local="$MAVEN_REPO" \
+        -DskipTests -Djacoco.skip=true \
+        install -Plocal-dev -pl :portfolio-target-definition -am
+    "$MAVEN_HOME/bin/mvn" -q -f "$UPSTREAM_DIR/portfolio-app/pom.xml" \
+        -Dmaven.repo.local="$MAVEN_REPO" \
+        -DskipTests -Djacoco.skip=true \
+        package -Plocal-dev \
+        -pl :name.abuchen.portfolio.pdfbox1,:name.abuchen.portfolio.pdfbox3,:name.abuchen.portfolio -am
+    touch "$marker"
+}
+
+runtime_classpath()
+{
+    local core_jar cp
+    core_jar="$UPSTREAM_DIR/name.abuchen.portfolio/target/name.abuchen.portfolio-$ENGINE_VERSION.jar"
+    cp="$core_jar"
+
+    while IFS= read -r jar; do
+        cp="$cp:$jar"
+    done < <(find "$MAVEN_REPO/p2/osgi/bundle" -type f -name '*.jar' -print 2>/dev/null | sort)
+
+    local dependency_roots=(
+        "$MAVEN_REPO/org/apache/servicemix/bundles"
+        "$MAVEN_REPO/com/google/guava"
+        "$MAVEN_REPO/com/google/protobuf"
+        "$MAVEN_REPO/com/google/code/gson"
+        "$MAVEN_REPO/org/apache/commons/commons-csv"
+        "$MAVEN_REPO/com/googlecode/json-simple"
+        "$MAVEN_REPO/org/jsoup"
+        "$MAVEN_REPO/com/auth0"
+    )
+    local existing=()
+    local root
+    for root in "${dependency_roots[@]}"; do
+        [[ -d "$root" ]] && existing+=("$root")
+    done
+
+    if [[ ${#existing[@]} -gt 0 ]]; then
+        while IFS= read -r jar; do
+            cp="$cp:$jar"
+        done < <(find "${existing[@]}" -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*.source_*.jar' -print | sort)
+    fi
+
+    printf '%s' "$cp"
+}
+
+prepare_java
+prepare_maven
+prepare_upstream
+build_engine
+
+CLASSPATH="$(runtime_classpath)"
+if [[ -n "$COMPARISON_XML" ]]; then
+    exec "$JAVA_HOME/bin/java" -cp "$CLASSPATH" \
+        name.abuchen.portfolio.cli.PortfolioPrototypeCli "$INPUT_XML" "$OUTPUT_DIR" "$COMPARISON_XML"
+else
+    exec "$JAVA_HOME/bin/java" -cp "$CLASSPATH" \
+        name.abuchen.portfolio.cli.PortfolioPrototypeCli "$INPUT_XML" "$OUTPUT_DIR"
+fi

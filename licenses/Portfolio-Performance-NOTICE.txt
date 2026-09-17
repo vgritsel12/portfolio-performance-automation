@@ -1,0 +1,12 @@
+PORTFOLIO PERFORMANCE — THIRD-PARTY NOTICE
+
+Upstream: https://github.com/portfolio-performance/portfolio
+Pinned revision: 2f3917512f4d042cc4dd2abcf24ae62d665f9b18
+License: Eclipse Public License 1.0; see Portfolio-Performance-EPL-1.0.txt.
+
+This public package includes Java command-line adapter sources in upstream-overlay/.
+It does not contain Portfolio Performance, Java or Maven binaries. The launcher
+retrieves/builds pinned upstream sources and dependencies on first use.
+The adapters invoke the official model and calculation engine; attribution to
+the original project is retained. No license for unrelated original project code
+is implied by this notice.

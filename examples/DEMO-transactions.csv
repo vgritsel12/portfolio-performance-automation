@@ -1,0 +1,4 @@
+Date,Type,Transaction Currency,ISIN,Security Name,Shares,Fees,Taxes,Value,Cash Account,Securities Account,Note
+2025-01-02,Deposit,USD,,,,,,10000,DEMO Cash,,DEMO synthetic opening deposit
+2025-02-03,Interest,USD,,,,,,100,DEMO Cash,,DEMO synthetic interest
+2025-03-03,Interest,USD,,,,,,100,DEMO Cash,,DEMO synthetic interest

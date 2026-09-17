@@ -1,0 +1,59 @@
+{
+  "source_file": "DEMO-portfolio.xml",
+  "reporting_currency": "USD",
+  "report_date": "2025-03-03",
+  "periods": {
+    "all_time": {
+      "period_code": "F2024-12-30_2025-03-03",
+      "requested_start_date": "2024-12-30",
+      "requested_end_date": "2025-03-03",
+      "effective_start_date": "2024-12-30",
+      "effective_end_date": "2025-03-03",
+      "cumulative_ttwror": 0.020000000000000018,
+      "annualized_ttwror": 0.12157002009178397,
+      "irr": 0.1280223680440662,
+      "profit": 200.0
+    },
+    "current_year": {
+      "period_code": "F2024-12-31_2025-12-31",
+      "requested_start_date": "2024-12-31",
+      "requested_end_date": "2025-12-31",
+      "effective_start_date": "2024-12-31",
+      "effective_end_date": "2025-03-03",
+      "cumulative_ttwror": 0.020000000000000018,
+      "annualized_ttwror": 0.12364737987152652,
+      "irr": 0.1280223680440662,
+      "profit": 200.0
+    }
+  },
+  "portfolio_market_value": 10200.0,
+  "portfolio_overview": {
+    "cash": {
+      "market_value": 10200.0,
+      "weight": 1.0,
+      "accounts": [
+        {
+          "account_uuid": "af5c4a21-0714-3251-bee4-389c1d388a5d",
+          "original_currency": "USD",
+          "original_value": 10200.0,
+          "reporting_currency": "USD",
+          "reporting_value": 10200.0
+        }
+      ]
+    },
+    "scope": {
+      "mode": "FULL_CLIENT",
+      "account_uuids": [
+        "af5c4a21-0714-3251-bee4-389c1d388a5d"
+      ],
+      "portfolio_uuids": []
+    },
+    "allocation_by_asset_class": [],
+    "scoped_holdings": [],
+    "top_holdings": []
+  },
+  "calculation_engine": {
+    "source": "Portfolio Performance",
+    "version_or_commit": "2f3917512f4d042cc4dd2abcf24ae62d665f9b18"
+  }
+}

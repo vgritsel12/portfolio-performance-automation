@@ -1,0 +1,910 @@
+#!/usr/bin/env python3
+"""Cross-platform launcher for the pinned Portfolio Performance CLI overlay."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+from pathlib import PurePosixPath
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from renderer.xstream_reference_adapter import xpath_compatible_xml  # noqa: E402
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+ENGINE_COMMIT = "2f3917512f4d042cc4dd2abcf24ae62d665f9b18"
+ENGINE_VERSION = "0.86.1-SNAPSHOT"
+MAVEN_VERSION = "3.9.11"
+CACHE_NAMESPACE = "dashboard"
+DOWNLOAD_TIMEOUT_SECONDS = 60
+DOWNLOAD_RETRIES = 3
+MIN_DOWNLOAD_FREE_BYTES = 256 * 1024 * 1024
+ENGINE_SOURCE_ARTIFACT = {
+    "component": "Portfolio Performance source",
+    "version": ENGINE_COMMIT,
+    "architecture": "source",
+    "name": f"portfolio-{ENGINE_COMMIT}.zip",
+    "url": (
+        "https://github.com/portfolio-performance/portfolio/archive/"
+        f"{ENGINE_COMMIT}.zip"
+    ),
+    "hash_algorithm": "sha256",
+    "hash": "980e56f90c99150356d62ef49a47f06101ed29cb8b1d7fdf4f22f6b97f31acfa",
+    "size": 12079789,
+    "verification_source": "reviewed pinned GitHub commit archive, 2026-07-29",
+}
+MAVEN_ARTIFACTS = {
+    ".zip": {
+        "component": "Apache Maven",
+        "version": MAVEN_VERSION,
+        "architecture": "all",
+        "name": f"apache-maven-{MAVEN_VERSION}-bin.zip",
+        "url": (
+            "https://archive.apache.org/dist/maven/maven-3/"
+            f"{MAVEN_VERSION}/binaries/apache-maven-{MAVEN_VERSION}-bin.zip"
+        ),
+        "hash_algorithm": "sha512",
+        "hash": (
+            "03e2d65d4483a3396980629f260e25cac0d8b6f7f2791e4dc20bc83f9514db8d"
+            "0f05b0479e699a5f34679250c49c8e52e961262ded468a20de0be254d8207076"
+        ),
+        "size": 9278421,
+        "verification_source": "Apache archive .sha512",
+    },
+    ".tar.gz": {
+        "component": "Apache Maven",
+        "version": MAVEN_VERSION,
+        "architecture": "all",
+        "name": f"apache-maven-{MAVEN_VERSION}-bin.tar.gz",
+        "url": (
+            "https://archive.apache.org/dist/maven/maven-3/"
+            f"{MAVEN_VERSION}/binaries/apache-maven-{MAVEN_VERSION}-bin.tar.gz"
+        ),
+        "hash_algorithm": "sha512",
+        "hash": (
+            "bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516"
+            "b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978"
+        ),
+        "size": 9160848,
+        "verification_source": "Apache archive .sha512",
+    },
+}
+JDK_ARTIFACTS = {
+    ("Windows", "x64"): {
+        "version": "21.0.12+8",
+        "name": "OpenJDK21U-jdk_x64_windows_hotspot_21.0.12_8.zip",
+        "hash": "9ba963ee2371874a74185d18bc7bb2ab9407df7683300855ed7606e0662321d0",
+        "size": 205069442,
+    },
+    ("Linux", "x64"): {
+        "version": "21.0.12+8",
+        "name": "OpenJDK21U-jdk_x64_linux_hotspot_21.0.12_8.tar.gz",
+        "hash": "e4446ff06a276155697597cc0f1b15da004ff083f4964a35271ecee567177370",
+        "size": 207486543,
+    },
+    ("Linux", "aarch64"): {
+        "version": "21.0.12+8",
+        "name": "OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.12_8.tar.gz",
+        "hash": "eba38e871b02d407897bfe017ea35352dfc1420ef6d2112425b0c67325ca509d",
+        "size": 205638274,
+    },
+    ("Darwin", "x64"): {
+        "version": "21.0.12+8",
+        "name": "OpenJDK21U-jdk_x64_mac_hotspot_21.0.12_8.tar.gz",
+        "hash": "6b85c260eea574a995eacd0b3ee23c8042aa93b23a08e6478edafca0a0333d7f",
+        "size": 194309619,
+    },
+    ("Darwin", "aarch64"): {
+        "version": "21.0.11+10",
+        "name": "OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.11_10.tar.gz",
+        "hash": "6ebcf221c9b41507b14c098e93c6ead6440b8d9bd154f8ec666c4c73abbdb201",
+        "size": 200030394,
+    },
+}
+for _jdk_key, _jdk_artifact in JDK_ARTIFACTS.items():
+    _jdk_release = _jdk_artifact["version"].replace("+", "%2B")
+    _jdk_artifact.update(
+        {
+            "component": "Eclipse Temurin JDK",
+            "architecture": _jdk_key[1],
+            "url": (
+                "https://github.com/adoptium/temurin21-binaries/releases/download/"
+                f"jdk-{_jdk_release}/{_jdk_artifact['name']}"
+            ),
+            "hash_algorithm": "sha256",
+            "verification_source": "Adoptium API package.checksum",
+        }
+    )
+
+
+def default_cache_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
+    elif platform.system() == "Darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "PPDelivery" / CACHE_NAMESPACE
+
+
+CACHE_DIR = Path(
+    os.environ.get(
+        "PP_PROTOTYPE_CACHE_DIR",
+        default_cache_dir(),
+    )
+).expanduser().resolve()
+UPSTREAM_DIR = Path(
+    os.environ.get(
+        "PP_UPSTREAM_DIR",
+        CACHE_DIR / f"portfolio-{ENGINE_COMMIT}",
+    )
+).expanduser().resolve()
+MAVEN_REPO = Path(
+    os.environ.get("PP_MAVEN_REPO", CACHE_DIR / "m2")
+).expanduser().resolve()
+OVERLAY_SOURCE = (
+    ROOT_DIR
+    / "upstream-overlay"
+    / "name.abuchen.portfolio"
+    / "src"
+    / "name"
+    / "abuchen"
+    / "portfolio"
+    / "cli"
+    / "PortfolioPrototypeCli.java"
+)
+CSV_OVERLAY_SOURCE = (
+    ROOT_DIR
+    / "upstream-overlay"
+    / "name.abuchen.portfolio"
+    / "src"
+    / "name"
+    / "abuchen"
+    / "portfolio"
+    / "model"
+    / "PortfolioCsvImportCli.java"
+)
+UPSTREAM_SOURCE = (
+    UPSTREAM_DIR
+    / "name.abuchen.portfolio"
+    / "src"
+    / "name"
+    / "abuchen"
+    / "portfolio"
+    / "cli"
+    / "PortfolioPrototypeCli.java"
+)
+OVERLAY_ROOT = ROOT_DIR / "upstream-overlay" / "name.abuchen.portfolio" / "src"
+UPSTREAM_OVERLAY_ROOT = UPSTREAM_DIR / "name.abuchen.portfolio" / "src"
+
+
+class LauncherError(Exception):
+    pass
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_xml", type=Path)
+    parser.add_argument("output_directory", type=Path, nargs="?")
+    parser.add_argument("comparison_xml", type=Path, nargs="?")
+    return parser.parse_args(argv)
+
+
+def file_hash(path: Path, algorithm: str = "sha256") -> str:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256(path: Path) -> str:
+    return file_hash(path, "sha256")
+
+
+def overlay_sha256() -> str:
+    digest = hashlib.sha256()
+    sources = sorted(OVERLAY_ROOT.rglob("*.java"))
+    if not sources:
+        raise LauncherError(f"CLI overlay не найден: {OVERLAY_ROOT}")
+    for source in sources:
+        relative = source.relative_to(OVERLAY_ROOT).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def executable(directory: Path, name: str) -> Path:
+    suffix = ".exe" if os.name == "nt" and not name.endswith(".cmd") else ""
+    return directory / f"{name}{suffix}"
+
+
+def run(
+    command: list[str],
+    *,
+    capture: bool = False,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=capture,
+            check=False,
+            env=env,
+        )
+    except OSError as error:
+        raise LauncherError(f"{label}: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise LauncherError(
+            f"{label} завершилось с кодом {result.returncode}{suffix}"
+        )
+    return result
+
+
+def download(url: str, destination: Path, label: str) -> None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Portfolio-Dashboard-Builder/1.0"},
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as response:
+                with destination.open("wb") as stream:
+                    shutil.copyfileobj(response, stream)
+            return
+        except Exception as error:
+            last_error = error
+            destination.unlink(missing_ok=True)
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(attempt)
+    curl = shutil.which("curl")
+    if curl:
+        result = subprocess.run(
+            [
+                curl,
+                "--fail",
+                "--location",
+                "--retry",
+                str(DOWNLOAD_RETRIES),
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                str(DOWNLOAD_TIMEOUT_SECONDS),
+                "--output",
+                str(destination),
+                "--url",
+                url,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0 and destination.is_file():
+            return
+        destination.unlink(missing_ok=True)
+        detail = (result.stderr or result.stdout).strip()
+        last_error = RuntimeError(f"curl exited {result.returncode}: {detail}")
+    raise LauncherError(f"{label}: загрузка не удалась: {last_error}")
+
+
+def download_verified(artifact: dict[str, object], destination: Path) -> None:
+    expected_size = int(artifact["size"])
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        required_free = max(MIN_DOWNLOAD_FREE_BYTES, expected_size * 2)
+        if shutil.disk_usage(destination.parent).free < required_free:
+            raise LauncherError(
+                f"{artifact['component']}: недостаточно свободного места"
+            )
+        download(
+            str(artifact["url"]),
+            destination,
+            str(artifact["component"]),
+        )
+        print(
+            f"RUNTIME_VERIFY {artifact['component']} {artifact['hash_algorithm']}",
+            flush=True,
+        )
+        actual_size = destination.stat().st_size
+        if actual_size != expected_size:
+            raise LauncherError(
+                f"{artifact['component']}: неверный размер {actual_size}"
+            )
+        with destination.open("rb") as stream:
+            prefix = stream.read(512).lstrip().lower()
+        if prefix.startswith((b"<html", b"<!doctype html", b"<?xml")):
+            raise LauncherError(
+                f"{artifact['component']}: вместо архива получен HTML/XML"
+            )
+        if str(artifact["name"]).endswith(".zip") and not prefix.startswith(b"pk"):
+            raise LauncherError(f"{artifact['component']}: ZIP signature отсутствует")
+        if str(artifact["name"]).endswith(".tar.gz") and not prefix.startswith(b"\x1f\x8b"):
+            raise LauncherError(f"{artifact['component']}: gzip signature отсутствует")
+        actual_hash = file_hash(destination, str(artifact["hash_algorithm"]))
+        if actual_hash != artifact["hash"]:
+            raise LauncherError(
+                f"{artifact['component']}: контрольная сумма не совпадает"
+            )
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def marker_payload(artifact: dict[str, object]) -> dict[str, object]:
+    return {
+        key: artifact[key]
+        for key in (
+            "component",
+            "version",
+            "architecture",
+            "name",
+            "hash_algorithm",
+            "hash",
+            "size",
+        )
+    }
+
+
+def marker_matches(target: Path, artifact: dict[str, object]) -> bool:
+    marker = target / ".verified.json"
+    try:
+        return json.loads(marker.read_text(encoding="utf-8")) == marker_payload(artifact)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+@contextmanager
+def cache_lock(name: str, timeout: float = 60.0):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = CACHE_DIR / f".{name}.lock"
+    deadline = time.monotonic() + timeout
+    descriptor: int | None = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 600:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise LauncherError(f"Таймаут блокировки кэша: {name}")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        lock.unlink(missing_ok=True)
+
+
+def ensure_cached_archive(
+    component_key: str,
+    target: Path,
+    artifact: dict[str, object],
+    locate,
+) -> tuple[Path, bool]:
+    with cache_lock(component_key):
+        located = locate(target) if target.is_dir() and marker_matches(target, artifact) else None
+        if located is not None:
+            print(f"RUNTIME_CACHE_HIT {artifact['component']}", flush=True)
+            return target, False
+        if target.exists():
+            shutil.rmtree(target)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f".{component_key}-private-", dir=CACHE_DIR
+        ) as temporary:
+            private = Path(temporary)
+            archive = private / str(artifact["name"])
+            unpacked = private / "unpacked"
+            print(f"RUNTIME_DOWNLOAD {artifact['component']}", flush=True)
+            download_verified(artifact, archive)
+            print(f"RUNTIME_EXTRACT {artifact['component']} safe archive", flush=True)
+            safe_extract(archive, unpacked)
+            staged = locate(unpacked)
+            if staged is None:
+                raise LauncherError(
+                    f"{artifact['component']}: архив имеет неожиданную структуру"
+                )
+            (staged / ".verified.json").write_text(
+                json.dumps(marker_payload(artifact), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(staged, target)
+            print(f"RUNTIME_CACHE_PUBLISH {artifact['component']} atomic", flush=True)
+        if not marker_matches(target, artifact) or locate(target) is None:
+            shutil.rmtree(target, ignore_errors=True)
+            raise LauncherError(
+                f"{artifact['component']}: проверенный кэш не опубликован"
+            )
+        return target, True
+
+
+def atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def safe_extract(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+
+    def checked(member_name: str) -> tuple[Path, tuple[str, ...]]:
+        normalized = member_name.replace("\\", "/")
+        member = PurePosixPath(normalized)
+        parts = member.parts
+        if (
+            not normalized
+            or member.is_absolute()
+            or any(part in {"", ".", ".."} for part in parts)
+            or (parts and re.fullmatch(r"[A-Za-z]:.*", parts[0]))
+        ):
+            raise LauncherError(f"Архив содержит небезопасный путь: {member_name}")
+        candidate = destination.joinpath(*parts)
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise LauncherError(
+                f"Архив содержит небезопасный путь: {member_name}"
+            ) from error
+        return resolved, parts
+
+    def prepare_target(target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        current = root
+        for part in target.relative_to(root).parts[:-1]:
+            current = current / part
+            if current.is_symlink():
+                raise LauncherError(
+                    f"Архив пытается записать через символическую ссылку: {target}"
+                )
+        if target.is_symlink():
+            raise LauncherError(
+                f"Архив пытается заменить символическую ссылку: {target}"
+            )
+
+    if archive.suffix.lower() == ".zip":
+        with zipfile.ZipFile(archive) as bundle:
+            entries: list[tuple[zipfile.ZipInfo, Path]] = []
+            seen: dict[tuple[str, ...], str] = {}
+            for member in bundle.infolist():
+                target, parts = checked(member.filename.rstrip("/"))
+                mode = member.external_attr >> 16
+                file_type = stat.S_IFMT(mode)
+                is_directory = member.is_dir() or file_type == stat.S_IFDIR
+                kind = "directory" if is_directory else "file"
+                collision_key = tuple(part.rstrip(" .").casefold() for part in parts)
+                if collision_key in seen:
+                    if seen[collision_key] == kind == "directory":
+                        continue
+                    raise LauncherError(
+                        f"Архив содержит повторяющийся путь: {member.filename}"
+                    )
+                seen[collision_key] = kind
+                if stat.S_ISLNK(mode) or file_type not in {
+                    0,
+                    stat.S_IFREG,
+                    stat.S_IFDIR,
+                }:
+                    raise LauncherError(
+                        f"Архив содержит запрещённый тип файла: {member.filename}"
+                    )
+                entries.append((member, target))
+            for member, target in entries:
+                if (
+                    member.is_dir()
+                    or stat.S_IFMT(member.external_attr >> 16) == stat.S_IFDIR
+                ):
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                prepare_target(target)
+                with bundle.open(member, "r") as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                mode = member.external_attr >> 16
+                if mode and os.name != "nt":
+                    target.chmod(mode & 0o777)
+    else:
+        with tarfile.open(archive, "r:*") as bundle:
+            entries: list[tuple[tarfile.TarInfo, Path]] = []
+            seen: dict[tuple[str, ...], str] = {}
+            for member in bundle.getmembers():
+                target, parts = checked(member.name.rstrip("/"))
+                kind = "directory" if member.isdir() else "file"
+                collision_key = tuple(part.rstrip(" .").casefold() for part in parts)
+                if collision_key in seen:
+                    if seen[collision_key] == kind == "directory":
+                        continue
+                    raise LauncherError(
+                        f"Архив содержит повторяющийся путь: {member.name}"
+                    )
+                seen[collision_key] = kind
+                if not (member.isdir() or member.isreg()):
+                    raise LauncherError(
+                        f"Архив содержит запрещённый тип файла: {member.name}"
+                    )
+                entries.append((member, target))
+            for member, target in entries:
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    if os.name != "nt":
+                        target.chmod(member.mode & 0o777)
+                    continue
+                prepare_target(target)
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise LauncherError(
+                        f"Архив не содержит данные файла: {member.name}"
+                    )
+                with source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                if os.name != "nt":
+                    target.chmod(member.mode & 0o777)
+
+
+def java_major(java: Path) -> int | None:
+    try:
+        result = subprocess.run(
+            [str(java), "-version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    match = re.search(r'version "(\d+)', result.stderr + result.stdout)
+    return int(match.group(1)) if match else None
+
+
+def find_java_home(root: Path) -> Path | None:
+    java_name = "java.exe" if os.name == "nt" else "java"
+    for candidate in root.rglob(java_name):
+        if candidate.parent.name == "bin" and java_major(candidate) == 21:
+            return candidate.parent.parent
+    return None
+
+
+def normalized_platform() -> tuple[str, str]:
+    system_name = platform.system()
+    machine = platform.machine().lower()
+    arch_codes = {
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+        "x86_64": "x64",
+        "amd64": "x64",
+    }
+    if machine not in arch_codes:
+        raise LauncherError(f"Неподдерживаемая архитектура: {machine}")
+    key = (system_name, arch_codes[machine])
+    if key not in JDK_ARTIFACTS:
+        raise LauncherError(
+            f"Неподдерживаемая система/архитектура до загрузки: {key}"
+        )
+    return key
+
+
+def prepare_java() -> Path:
+    configured = os.environ.get("PP_JAVA_HOME")
+    if configured:
+        java_home = Path(configured).expanduser().resolve()
+        java = executable(java_home / "bin", "java")
+        if java_major(java) != 21:
+            raise LauncherError(f"PP_JAVA_HOME не содержит Java 21: {java_home}")
+        return java_home
+
+    system_java = shutil.which("java")
+    if system_java and java_major(Path(system_java)) == 21:
+        return Path(system_java).resolve().parent.parent
+
+    platform_key = normalized_platform()
+    artifact = JDK_ARTIFACTS[platform_key]
+    cache_version = str(artifact["version"]).replace("+", "_")
+    java_home = CACHE_DIR / f"jdk-{cache_version}-{platform_key[0].lower()}-{platform_key[1]}"
+    cached_java = executable(java_home / "bin", "java")
+    if marker_matches(java_home, artifact) and java_major(cached_java) == 21:
+        print("RUNTIME_CACHE_HIT Java 21", flush=True)
+        return java_home
+
+    ensure_cached_archive("jdk", java_home, artifact, find_java_home)
+    return java_home
+
+
+def prepare_maven() -> tuple[Path, Path]:
+    configured = os.environ.get("PP_MAVEN_HOME")
+    executable_name = "mvn.cmd" if os.name == "nt" else "mvn"
+    if configured:
+        maven_home = Path(configured).expanduser().resolve()
+        maven = maven_home / "bin" / executable_name
+        if not maven.is_file():
+            raise LauncherError(f"PP_MAVEN_HOME не содержит Maven: {maven_home}")
+        return maven_home, maven
+
+    system_maven = shutil.which(executable_name)
+    if system_maven:
+        maven = Path(system_maven).resolve()
+        return maven.parent.parent, maven
+
+    suffix = ".zip" if os.name == "nt" else ".tar.gz"
+    artifact = MAVEN_ARTIFACTS[suffix]
+    maven_home = CACHE_DIR / f"apache-maven-{MAVEN_VERSION}-{suffix[1:].replace('.', '_')}"
+    maven = maven_home / "bin" / executable_name
+    if marker_matches(maven_home, artifact) and maven.is_file():
+        print(f"RUNTIME_CACHE_HIT Maven {MAVEN_VERSION}", flush=True)
+        return maven_home, maven
+
+    def locate_maven(root: Path) -> Path | None:
+        direct = root / f"apache-maven-{MAVEN_VERSION}"
+        if (direct / "bin" / executable_name).is_file():
+            return direct
+        if (root / "bin" / executable_name).is_file():
+            return root
+        return None
+
+    ensure_cached_archive("maven", maven_home, artifact, locate_maven)
+    return maven_home, maven
+
+
+def prepare_upstream() -> None:
+    if (UPSTREAM_DIR / ".git").is_dir():
+        git = shutil.which("git")
+        if git:
+            result = run(
+                [git, "-C", str(UPSTREAM_DIR), "rev-parse", "HEAD"],
+                capture=True,
+                label="Проверка Portfolio Performance source",
+            )
+            if result.stdout.strip() != ENGINE_COMMIT:
+                raise LauncherError(
+                    "Кэш Portfolio Performance содержит другой commit"
+                )
+    else:
+        def locate_source(root: Path) -> Path | None:
+            if (root / "name.abuchen.portfolio").is_dir():
+                return root
+            candidates = [item for item in root.iterdir() if item.is_dir()]
+            if len(candidates) == 1 and (
+                candidates[0] / "name.abuchen.portfolio"
+            ).is_dir():
+                return candidates[0]
+            return None
+
+        ensure_cached_archive(
+            "portfolio-source",
+            UPSTREAM_DIR,
+            ENGINE_SOURCE_ARTIFACT,
+            locate_source,
+        )
+
+    sources = sorted(OVERLAY_ROOT.rglob("*.java"))
+    if not sources or not any(
+        source in sources for source in (OVERLAY_SOURCE, CSV_OVERLAY_SOURCE)
+    ):
+        raise LauncherError(f"CLI overlay не найден: {OVERLAY_ROOT}")
+    with cache_lock("portfolio-overlay"):
+        for source in sources:
+            destination = UPSTREAM_OVERLAY_ROOT / source.relative_to(OVERLAY_ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if (
+                not destination.is_file()
+                or sha256(source) != sha256(destination)
+            ):
+                shutil.copy2(source, destination)
+
+
+def core_jar() -> Path:
+    return (
+        UPSTREAM_DIR
+        / "name.abuchen.portfolio"
+        / "target"
+        / f"name.abuchen.portfolio-{ENGINE_VERSION}.jar"
+    )
+
+
+def jar_contains_cli(java_home: Path, jar: Path) -> bool:
+    if not jar.is_file():
+        return False
+    jar_tool = executable(java_home / "bin", "jar")
+    try:
+        result = subprocess.run(
+            [str(jar_tool), "tf", str(jar)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    required = []
+    if OVERLAY_SOURCE.is_file():
+        required.append("name/abuchen/portfolio/cli/PortfolioPrototypeCli.class")
+    if CSV_OVERLAY_SOURCE.is_file():
+        required.append("name/abuchen/portfolio/model/PortfolioCsvImportCli.class")
+    if not required:
+        return False
+    return result.returncode == 0 and all(item in result.stdout for item in required)
+
+
+def build_engine(java_home: Path, maven: Path) -> None:
+    overlay_hash = overlay_sha256()
+    marker = CACHE_DIR / f"build-{ENGINE_COMMIT}-{overlay_hash}.ok"
+    expected_marker = f"{ENGINE_COMMIT} {overlay_hash}"
+    if (
+        marker.is_file()
+        and marker.read_text(encoding="utf-8").strip() == expected_marker
+        and jar_contains_cli(java_home, core_jar())
+    ):
+        print("RUNTIME_CACHE_HIT Portfolio Performance engine", flush=True)
+        return
+    with cache_lock("engine-build", timeout=1800):
+        if (
+            marker.is_file()
+            and marker.read_text(encoding="utf-8").strip() == expected_marker
+            and jar_contains_cli(java_home, core_jar())
+        ):
+            print("RUNTIME_CACHE_HIT Portfolio Performance engine", flush=True)
+            return
+        marker.unlink(missing_ok=True)
+        print("RUNTIME_BUILD Portfolio Performance engine", flush=True)
+        maven_file = UPSTREAM_DIR / "portfolio-app" / "pom.xml"
+        common = [
+            str(maven),
+            "-q",
+            "-f",
+            str(maven_file),
+            f"-Dmaven.repo.local={MAVEN_REPO}",
+            "-DskipTests",
+            "-Djacoco.skip=true",
+        ]
+        build_env = os.environ.copy()
+        build_env["JAVA_HOME"] = str(java_home)
+        build_env["PATH"] = os.pathsep.join(
+            [str(java_home / "bin"), build_env.get("PATH", "")]
+        )
+        run(
+            common
+            + [
+                "install",
+                "-Plocal-dev",
+                "-pl",
+                ":portfolio-target-definition",
+                "-am",
+            ],
+            label="Подготовка зависимостей Portfolio Performance",
+            env=build_env,
+        )
+        run(
+            common
+            + [
+                "package",
+                "-Plocal-dev",
+                "-pl",
+                (
+                    ":name.abuchen.portfolio.pdfbox1,"
+                    ":name.abuchen.portfolio.pdfbox3,"
+                    ":name.abuchen.portfolio"
+                ),
+                "-am",
+            ],
+            label="Сборка Portfolio Performance",
+            env=build_env,
+        )
+        if not jar_contains_cli(java_home, core_jar()):
+            raise LauncherError("Собранный Portfolio Performance JAR не содержит CLI")
+        atomic_write(marker, expected_marker + "\n")
+        print("RUNTIME_CACHE_PUBLISH Portfolio Performance engine atomic", flush=True)
+
+
+def runtime_classpath() -> str:
+    jars = [core_jar()]
+    p2_root = MAVEN_REPO / "p2" / "osgi" / "bundle"
+    if p2_root.is_dir():
+        jars.extend(sorted(p2_root.rglob("*.jar")))
+
+    dependency_roots = [
+        MAVEN_REPO / "org" / "apache" / "servicemix" / "bundles",
+        MAVEN_REPO / "com" / "google" / "guava",
+        MAVEN_REPO / "com" / "google" / "protobuf",
+        MAVEN_REPO / "com" / "google" / "code" / "gson",
+        MAVEN_REPO / "org" / "apache" / "commons" / "commons-csv",
+        MAVEN_REPO / "commons-codec" / "commons-codec",
+        MAVEN_REPO / "commons-io" / "commons-io",
+        MAVEN_REPO / "com" / "googlecode" / "json-simple",
+        MAVEN_REPO / "org" / "jsoup",
+        MAVEN_REPO / "com" / "auth0",
+    ]
+    for root in dependency_roots:
+        if not root.is_dir():
+            continue
+        for jar in sorted(root.rglob("*.jar")):
+            name = jar.name
+            if name.endswith("-sources.jar") or ".source_" in name:
+                continue
+            jars.append(jar)
+    return os.pathsep.join(str(jar) for jar in jars)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    input_xml = args.input_xml.expanduser().resolve()
+    output_directory = (
+        args.output_directory.expanduser().resolve()
+        if args.output_directory
+        else (ROOT_DIR / "output").resolve()
+    )
+    comparison_xml = (
+        args.comparison_xml.expanduser().resolve()
+        if args.comparison_xml
+        else None
+    )
+    if not input_xml.is_file():
+        print(f"XML-файл не найден: {input_xml}", file=sys.stderr)
+        return 66
+
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        MAVEN_REPO.mkdir(parents=True, exist_ok=True)
+        java_home = prepare_java()
+        _, maven = prepare_maven()
+        prepare_upstream()
+        build_engine(java_home, maven)
+        java = executable(java_home / "bin", "java")
+        with xpath_compatible_xml(input_xml) as compatible_input:
+            if comparison_xml is None:
+                command = [
+                    str(java),
+                    "-cp",
+                    runtime_classpath(),
+                    "name.abuchen.portfolio.cli.PortfolioPrototypeCli",
+                    str(compatible_input),
+                    str(output_directory),
+                ]
+                return subprocess.run(command, check=False).returncode
+            with xpath_compatible_xml(comparison_xml) as compatible_comparison:
+                command = [
+                    str(java),
+                    "-cp",
+                    runtime_classpath(),
+                    "name.abuchen.portfolio.cli.PortfolioPrototypeCli",
+                    str(compatible_input),
+                    str(output_directory),
+                    str(compatible_comparison),
+                ]
+                return subprocess.run(command, check=False).returncode
+    except LauncherError as error:
+        print(f"Ошибка запуска Portfolio Performance: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

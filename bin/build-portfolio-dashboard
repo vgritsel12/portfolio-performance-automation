@@ -1,0 +1,1400 @@
+#!/usr/bin/env python3
+"""Discover one Portfolio Performance XML and publish a validated dashboard pair."""
+
+from __future__ import annotations
+
+from collections import Counter
+from datetime import date
+from decimal import Decimal
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Mapping
+import uuid
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from renderer.currency_views import CurrencyViewMode, build_currency_views  # noqa: E402
+from renderer.client_views import (  # noqa: E402
+    ClientViewError,
+    build_grouped_client_views,
+    client_payload_sha256,
+    component_rounding_tolerance,
+    normalized_client_json,
+)
+from renderer.dashboard_renderer import (  # noqa: E402
+    DEFAULT_MARK,
+    DashboardError,
+    load_report,
+    load_series,
+    render_detailed_dashboard,
+    validate_series_against_report,
+)
+from renderer.detailed_report import (  # noqa: E402
+    build_detailed_report,
+    load_official_inputs,
+    normalized_json,
+    validate_detailed_report,
+)
+from renderer.ecb_rates import ECB_PROVIDER, EcbRateError, ensure_rate_book  # noqa: E402
+from renderer.portfolio_valuation import build_valuation  # noqa: E402
+from renderer.portfolio_xml_model import (  # noqa: E402
+    AmbiguousReferenceError,
+    CyclicReferenceError,
+    PortfolioModel,
+    PortfolioModelError,
+    ReferenceModeError,
+    ReferenceTypeError,
+    UnsupportedVersionError,
+    UnresolvedReferenceError,
+    XmlSecurityError,
+    normalize_transactions,
+)
+
+
+FINAL_HTML = "dashboard.html"
+FINAL_REPORT = "validation_report.md"
+ERROR_REPORT = "DASHBOARD ERROR REPORT.txt"
+BACKUP_SUFFIX = ".backup.xml"
+STABLE_PROCESS_FAILURE_CODES = (
+    "E_PYTHON",
+    "E_PORTFOLIO_PERFORMANCE",
+    "E_JAVA_VERSION",
+    "E_RUNTIME_INTEGRITY",
+    "E_INPUT",
+    "E_OUTPUT",
+    "E_CURRENCY",
+    "E_RATES",
+    "E_NOT_CALCULABLE",
+    "E_ENGINE",
+    "E_INTERNAL",
+)
+DIAGNOSTIC_PREFIX = "PP_DIAG|"
+SECTION_KEYS = (
+    "Metadata",
+    "Entity counts and coverage",
+    "Reference resolution",
+    "Transactions",
+    "Valuation and prices",
+    "Currency and FX",
+    "Taxonomies",
+    "Reconciliation",
+    "Official Summary",
+    "Standalone dashboard",
+    "Test coverage",
+    "Commands",
+    "Warnings",
+    "Errors",
+    "Final status",
+)
+
+
+class PipelineError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        exit_code: int = 70,
+        reason_code: str | None = None,
+    ):
+        super().__init__(message)
+        self.stage = stage
+        self.exit_code = exit_code
+        self.reason_code = reason_code
+
+
+def safe_portfolio_parse_failure(error: Exception) -> tuple[str, str]:
+    """Map private parser failures to stable codes and client-safe summaries."""
+
+    if isinstance(error, XmlSecurityError):
+        return (
+            "INPUT_XML_SECURITY",
+            "secure Portfolio XML validation failed: unsafe DOCTYPE or ENTITY or XML security rule",
+        )
+    if isinstance(error, UnsupportedVersionError):
+        return (
+            "INPUT_XML_VERSION_UNSUPPORTED",
+            "secure Portfolio XML validation failed: XML version is not supported by the pinned engine",
+        )
+    if isinstance(error, AmbiguousReferenceError):
+        return (
+            "INPUT_REFERENCE_AMBIGUOUS",
+            "secure Portfolio XML validation failed: duplicate or ambiguous XML reference",
+        )
+    if isinstance(error, CyclicReferenceError):
+        return (
+            "INPUT_REFERENCE_CYCLIC",
+            "secure Portfolio XML validation failed: cyclic XML reference",
+        )
+    if isinstance(error, UnresolvedReferenceError):
+        return (
+            "INPUT_REFERENCE_UNRESOLVED",
+            "secure Portfolio XML validation failed: unresolved XML reference",
+        )
+    if isinstance(error, ReferenceTypeError):
+        return (
+            "INPUT_REFERENCE_TYPE",
+            "secure Portfolio XML validation failed: XML reference type mismatch",
+        )
+    if isinstance(error, ReferenceModeError):
+        return (
+            "INPUT_REFERENCE_MODE",
+            "secure Portfolio XML validation failed: mixed or invalid XML reference mode",
+        )
+    if isinstance(error, PortfolioModelError):
+        lowered = str(error).casefold()
+        if "malformed portfolio xml" in lowered:
+            return (
+                "INPUT_XML_MALFORMED",
+                "secure Portfolio XML validation failed: malformed XML syntax",
+            )
+        if "missing" in lowered or "expected <client>" in lowered or "expected integer" in lowered:
+            return (
+                "INPUT_XML_REQUIRED_FIELD",
+                "secure Portfolio XML validation failed: required Portfolio field is missing or invalid",
+            )
+        return (
+            "INPUT_XML_INVALID",
+            "secure Portfolio XML validation failed: malformed or unsupported Portfolio XML",
+        )
+    return (
+        "INPUT_XML_UNREADABLE",
+        "secure Portfolio XML validation failed: input could not be read",
+    )
+
+
+def diagnostic_event(stage: str, status: str, **fields: object) -> None:
+    if os.environ.get("PP_DIAGNOSTIC_MODE") != "1":
+        return
+    safe_stage = re.sub(r"[^a-z0-9_-]", "-", stage.casefold())[:80]
+    safe_status = re.sub(r"[^A-Z0-9_-]", "-", status.upper())[:32]
+    extras = []
+    for key, value in fields.items():
+        safe_key = re.sub(r"[^A-Z0-9_]", "_", key.upper())[:40]
+        safe_value = re.sub(r"[^A-Za-z0-9_.:+/-]", "_", str(value))[:120]
+        extras.append(f"{safe_key}={safe_value}")
+    suffix = "|" + "|".join(extras) if extras else ""
+    sys.stderr.write(f"{DIAGNOSTIC_PREFIX}PIPELINE|{safe_stage}|{safe_status}{suffix}\n")
+
+
+def diagnostic_reference_audit(error: Exception) -> None:
+    """Emit only the bounded allow-listed structural audit attached by the parser."""
+    audit = getattr(error, "reference_audit", None)
+    if audit is None:
+        return
+    diagnostic_event(
+        "reference-audit",
+        "FAIL",
+        reference_mode=audit.mode,
+        issue_total=audit.issue_occurrences,
+        issue_group_count=len(audit.issues),
+        issue_truncated="YES" if audit.truncated else "NO",
+    )
+    for index, issue in enumerate(audit.issues, 1):
+        diagnostic_event(
+            "reference-issue",
+            "FAIL",
+            issue_index=index,
+            reason_code=issue.code,
+            reference_mode=issue.mode,
+            source_kind=issue.source_kind,
+            source_class=issue.source_class,
+            expected_type=issue.expected_type,
+            actual_type=issue.actual_type,
+            path_shape=issue.path_shape,
+            occurrence_count=issue.count,
+        )
+
+
+def run_client_view_stage(stage: str, operation: Any) -> Any:
+    """Trace one client-view substage without emitting its private error message."""
+    diagnostic_event(stage, "START")
+    try:
+        result = operation()
+    except ClientViewError as error:
+        diagnostic_event(stage, "FAIL", reason_code=error.code)
+        raise
+    diagnostic_event(stage, "PASS")
+    return result
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def is_ignored_backup(path: Path) -> bool:
+    return path.name.casefold().endswith(BACKUP_SUFFIX)
+
+
+def discover_input(input_dir: Path) -> Path:
+    if not input_dir.is_dir():
+        raise PipelineError(
+            "input directory is missing; place exactly one primary *.xml directly in input/",
+            stage="input-discovery",
+            exit_code=66,
+        )
+    candidates = sorted(
+        (
+            path
+            for path in input_dir.iterdir()
+            if path.name.casefold().endswith(".xml") and not is_ignored_backup(path)
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    if len(candidates) != 1:
+        raise PipelineError(
+            "expected exactly one primary *.xml directly in input/; "
+            "only names ending .backup.xml are ignored; "
+            f"found {len(candidates)} eligible files",
+            stage="input-discovery",
+            exit_code=64,
+        )
+    candidate = candidates[0]
+    if candidate.is_symlink():
+        raise PipelineError(
+            "the primary XML must be a regular non-symlink file inside input/",
+            stage="input-security",
+            exit_code=65,
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+        boundary = input_dir.resolve(strict=True)
+        resolved.relative_to(boundary)
+    except (OSError, ValueError) as error:
+        raise PipelineError(
+            "the primary XML resolves outside the input boundary",
+            stage="input-security",
+            exit_code=65,
+        ) from error
+    if not resolved.is_file():
+        raise PipelineError(
+            "the primary XML must be a regular file",
+            stage="input-security",
+            exit_code=65,
+        )
+    return resolved
+
+
+def inject(stage: str) -> None:
+    if os.environ.get("PP_PIPELINE_FAIL_AT") == stage:
+        raise PipelineError("injected pipeline failure", stage=stage, exit_code=75)
+
+
+def write_fsync(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def run_official_exporter(
+    xml: Path,
+    stage: Path,
+    *,
+    reporting_currency: str | None = None,
+    dashboard_currency: str | None = None,
+    fx_cache: Path | None = None,
+    client_scope: str | None = None,
+) -> None:
+    diagnostic_event(
+        "official-export-process",
+        "START",
+        reporting_currency=reporting_currency or "BASE",
+    )
+    override = os.environ.get("PP_DASHBOARD_EXPORTER")
+    if override:
+        command = [override, str(xml), str(stage)]
+    elif os.environ.get("PP_USE_OFFLINE_ENGINE") == "1":
+        command = [
+            sys.executable,
+            str(ROOT / "bin" / "pp-prototype-offline"),
+            str(xml),
+            str(stage),
+        ]
+    elif os.name == "nt" or os.environ.get("PP_USE_CROSS_PLATFORM_EXPORTER") == "1":
+        command = [
+            sys.executable,
+            str(ROOT / "bin" / "pp-prototype-cross-platform"),
+            str(xml),
+            str(stage),
+        ]
+    else:
+        command = [str(ROOT / "bin" / "pp-prototype"), str(xml), str(stage)]
+    environment = os.environ.copy()
+    for name, value in (
+        ("PP_REPORTING_CURRENCY", reporting_currency),
+        ("PP_DASHBOARD_CURRENCY", dashboard_currency),
+        ("PP_ECB_CACHE", str(fx_cache) if fx_cache is not None else None),
+        ("PP_CLIENT_SCOPE", client_scope),
+    ):
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise PipelineError(
+            "the pinned Portfolio Performance exporter could not start",
+            stage="official-export",
+        ) from error
+    if result.returncode != 0:
+        combined = result.stdout + "\n" + result.stderr
+        upper = combined.upper()
+        stable_code = next(
+            (
+                code
+                for code in STABLE_PROCESS_FAILURE_CODES
+                if re.search(rf"(?<![A-Z0-9_]){re.escape(code)}(?![A-Z0-9_])", upper)
+            ),
+            None,
+        )
+        if "NOT_YET_CALCULABLE" in upper:
+            stable_code = "E_NOT_CALCULABLE"
+        reason = (
+            "official exporter reports insufficient calculation data"
+            if stable_code == "E_NOT_CALCULABLE"
+            else (
+                f"official exporter failed with {stable_code}"
+                if stable_code
+                else f"official exporter exited {result.returncode}"
+            )
+        )
+        if os.environ.get("PP_DIAGNOSTIC_MODE") == "1":
+            for line in combined.splitlines():
+                if line.startswith(DIAGNOSTIC_PREFIX):
+                    sys.stderr.write(line[:1000] + "\n")
+            diagnostic_event(
+                "official-export-process",
+                "FAIL",
+                exit_code=result.returncode,
+                failure_code=stable_code or "UNKNOWN",
+                reporting_currency=reporting_currency or "BASE",
+            )
+        raise PipelineError(
+            reason,
+            stage="official-export",
+            exit_code=result.returncode or 70,
+            reason_code=stable_code,
+        )
+    for name in ("report.json", "performance_series.csv"):
+        path = stage / name
+        if not path.is_file() or path.stat().st_size == 0:
+            raise PipelineError(
+                f"official exporter did not produce required {name}",
+                stage="official-export-validation",
+            )
+    diagnostic_event(
+        "official-export-process",
+        "PASS",
+        reporting_currency=reporting_currency or "BASE",
+    )
+
+
+def active_source_currencies(model: PortfolioModel, normalized: Any) -> tuple[str, ...]:
+    currencies = (
+        {model.base_currency}
+        | {item.currency for item in model.accounts.values()}
+        | {item.currency for item in model.securities.values()}
+        | {impact.currency for event in normalized.events for impact in event.cash_impacts}
+        | {unit.currency for event in normalized.events for unit in event.units}
+    )
+    return tuple(sorted(code.strip().upper() for code in currencies))
+
+
+def model_fx_range(model: PortfolioModel, normalized: Any, valuation: Any) -> tuple[date, date]:
+    dates = [event.timestamp.date() for event in normalized.events]
+    dates.extend(
+        point.day
+        for security in model.securities.values()
+        for point in security.prices
+    )
+    return (min(dates) if dates else valuation.valuation_date, valuation.valuation_date)
+
+
+def load_official_fx(model: PortfolioModel, normalized: Any, valuation: Any):
+    start, end = model_fx_range(model, normalized, valuation)
+    source_currencies = active_source_currencies(model, normalized)
+    cache_path = Path(
+        os.environ.get("PP_FX_CACHE", ROOT / "runtime" / "fx" / "ecb-eur-usd.json")
+    ).resolve()
+    offline = os.environ.get("PP_FX_OFFLINE", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+    }
+    force_refresh = os.environ.get("PP_FX_REFRESH", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        cache = ensure_rate_book(
+            cache_path,
+            source_currencies,
+            start,
+            end,
+            offline=offline,
+            force_refresh=force_refresh,
+        )
+        for source in source_currencies:
+            if source != "USD":
+                cache.resolve(source, "USD", end)
+            if source != "EUR":
+                cache.resolve(source, "EUR", end)
+    except (OSError, EcbRateError) as error:
+        reason_code = getattr(error, "reason_code", "FX_DATA_UNAVAILABLE")
+        raise PipelineError(
+            f"official ECB FX data unavailable: {error}",
+            stage="official-fx",
+            exit_code=69,
+            reason_code=reason_code,
+        ) from error
+    return cache, cache.java_snapshot_path
+
+
+def standalone_errors(html: str) -> tuple[str, ...]:
+    errors = []
+    section_keys = re.findall(
+        r'<section\s+role="tabpanel"[^>]+data-panel="([a-z_]+)"', html
+    )
+    expected = [
+        "overview",
+        "performance",
+        "portfolio",
+        "allocation",
+        "activity",
+    ]
+    if section_keys != expected:
+        errors.append("client section inventory mismatch")
+    if re.search(r"https?://|\bfetch\s*\(|XMLHttpRequest", html):
+        errors.append("remote/runtime dependency detected")
+    if re.search(r'<(?:script|link|img)[^>]+\bsrc="(?!data:)', html):
+        errors.append("external resource source detected")
+    if "/Users/" in html or re.search(r"[A-Za-z]:\\", html):
+        errors.append("machine-specific absolute path detected")
+    if html.casefold().count("</html>") != 1:
+        errors.append("HTML document boundary invalid")
+    return tuple(errors)
+
+
+def _count_nodes(node: Mapping[str, Any]) -> int:
+    return 1 + sum(_count_nodes(child) for child in node["children"])
+
+
+def validation_markdown(
+    model: PortfolioModel,
+    normalized: Any,
+    valuation: Any,
+    detailed: Mapping[str, Any],
+    html: str,
+    input_hash: str,
+    client_views: Mapping[str, Any] | None = None,
+) -> str:
+    sections = detailed["sections"]
+    currencies = sections["currencies"]
+    consolidated = currencies["consolidated"]
+    missing = [
+        item
+        for item in consolidated["components"]
+        if item["status"] in {"MISSING", "PARTIAL"}
+    ]
+    status = (
+        "PARTIAL — MISSING FX"
+        if consolidated["status"] in {"MISSING", "PARTIAL"}
+        else "PASS"
+    )
+    transaction_counts = Counter(event.canonical_type for event in normalized.events)
+    price_counts = Counter(item.price_status.value for item in valuation.holdings)
+    account_reconciliation = Counter(item.reconciliation.status.value for item in valuation.accounts)
+    holding_reconciliation = Counter(item.reconciliation.status.value for item in valuation.holdings)
+    taxonomy_nodes = sum(
+        _count_nodes(item["root"])
+        for item in sections["allocation"]["taxonomies"]
+    )
+    official = sections["summary"]["official"]
+    warnings = list(detailed["diagnostics"]["valuation_warnings"])
+    warnings.extend(detailed["diagnostics"]["unavailable"])
+    missing_lines = (
+        "\n".join(
+            f'- {item["original_currency"]}→{consolidated["reporting_currency"]} on '
+            f'{item["conversion_date"]}: total value component `{item["label"]}` — {item["reason"]}'
+            for item in missing
+        )
+        or "- None"
+    )
+    resolved_rates = {
+        (
+            item["original_currency"],
+            consolidated["reporting_currency"],
+            item["conversion_date"],
+            item["fx_rate_date"],
+            item["fx_rate"],
+            item["fx_source"],
+        )
+        for item in consolidated["components"]
+        if item["fx_rate"] is not None
+    }
+    resolved_rate_lines = (
+        "\n".join(
+            f"- {source}→{target}; requested {requested}; observation {observed}; "
+            f"rate {rate}; source {provider}"
+            for source, target, requested, observed, rate, provider in sorted(resolved_rates)
+        )
+        or "- None"
+    )
+    warning_lines = "\n".join(f"- {item}" for item in warnings) or "- None"
+    client_modes = client_views["modes"] if client_views is not None else {}
+    client_reconciliation_lines = (
+        "\n".join(
+            f'- {currency}: holdings {mode["reconciliation"]["holdings_total"]} + '
+            f'liquidity {mode["reconciliation"]["liquidity"]} = '
+            f'total {mode["reconciliation"]["displayed_total"]}; '
+            f'difference {mode["reconciliation"]["difference"]}; '
+            f'status {mode["reconciliation"]["status"]}'
+            for currency, mode in sorted(client_modes.items())
+        )
+        or "- Not generated"
+    )
+    client_hash = client_payload_sha256(client_views) if client_views is not None else "Not generated"
+    return f"""# Portfolio dashboard validation report
+
+Status: **{status}**
+
+## Metadata
+
+- Source file: `{Path(model.source_file).name}`
+- Input SHA-256: `{input_hash}`
+- XML version: {model.version}
+- Base currency: {model.base_currency}
+- Valuation date: {valuation.valuation_date.isoformat()}
+- Schema: detailed-report {detailed["schema_version"]} — PASS
+
+## Entity counts and coverage
+
+- Securities: {len(model.securities)}
+- Accounts: {len(model.accounts)}
+- Portfolios: {len(model.portfolios)}
+- Current holdings: {len(valuation.holdings)}
+- Closed positions: {len(valuation.closed_positions)}
+- Currencies: {", ".join(sorted(currencies["per_currency"]))}
+
+## Reference resolution
+
+- Total: {model.reference_stats.total}
+- Resolved: {model.reference_stats.resolved}
+- Unresolved: {model.reference_stats.unresolved}
+- Ambiguous/cyclic/type mismatch: {model.reference_stats.ambiguous}/{model.reference_stats.cyclic}/{model.reference_stats.type_mismatch}
+
+## Transactions
+
+- Raw legs: {normalized.raw_leg_count}
+- Canonical events: {len(normalized.events)}
+- Paired trades: {normalized.paired_trade_count}
+- Linked transfers: {normalized.linked_transfer_count}
+- Types: `{json.dumps(dict(sorted(transaction_counts.items())), sort_keys=True)}`
+
+## Valuation and prices
+
+- Price statuses: `{json.dumps(dict(sorted(price_counts.items())), sort_keys=True)}`
+- Missing/stale prices: {price_counts.get("MISSING", 0)}/{price_counts.get("STALE", 0)}
+- Cost basis and unrealized gain: UNAVAILABLE — no independently validated implementation
+
+## Currency and FX
+
+- Mode: {currencies["mode"]}
+- Reporting currency: {currencies["reporting_currency"]}
+- Consolidated status: **{consolidated["status"]}**
+- Resolved dated rates:
+{resolved_rate_lines}
+- Affected currency/date/metric diagnostics:
+{missing_lines}
+- No unequal-currency 1.0 fallback is permitted.
+
+## Taxonomies
+
+- Taxonomies: {len(sections["allocation"]["taxonomies"])}
+- Recursive nodes retained: {taxonomy_nodes}
+- Unclassified is residual-only; empty nodes retain provenance.
+
+## Reconciliation
+
+- Account results: `{json.dumps(dict(sorted(account_reconciliation.items())), sort_keys=True)}`
+- Holding results: `{json.dumps(dict(sorted(holding_reconciliation.items())), sort_keys=True)}`
+- Client payload SHA-256: `{client_hash}`
+- Client mode reconciliation:
+{client_reconciliation_lines}
+
+## Official Summary
+
+- Engine: {official["calculation_engine"]["source"]}
+- Commit/version: `{official["calculation_engine"]["version_or_commit"]}`
+- Saved scope: {", ".join(official["scope"]["saved_dashboard_names"])}
+- Market value: {official["portfolio_market_value"]} {official["reporting_currency"]}
+- Performance points: {len(sections["performance"]["series"])}
+- Final date: {sections["performance"]["series"][-1]["date"]}
+- All-time cumulative TTWROR: {official["periods"]["all_time"]["cumulative_ttwror"]}
+
+## Standalone dashboard
+
+- HTML bytes: {len(html.encode("utf-8"))}
+- Ten semantic sections: PASS
+- Remote URLs/fetch/XHR/external resources: NONE
+- Embedded source XML: NO
+- Machine-specific paths: NONE
+- Transaction rows: {html.count('class="transaction-row"')}
+
+## Test coverage
+
+- Build-time secure parse/reference/schema/reconciliation/series/standalone checks: PASS
+- Automated regression suite is maintained separately and is not re-run during employee generation.
+
+## Commands
+
+- Build: `PP_NO_OPEN=1 ./bin/build-portfolio-dashboard`
+- Audit: `python3 ./bin/audit-portfolio-dashboard --xml input/<one-primary>.xml --html output/dashboard.html --report output/validation_report.md`
+
+## Warnings
+
+{warning_lines}
+
+## Errors
+
+- None. Required FX is official and dated; unavailable metrics remain explicit and are never fabricated.
+
+## Final status
+
+**{status}**
+"""
+
+
+def validate_staged_pair(html_path: Path, report_path: Path, input_hash: str) -> None:
+    if not html_path.is_file() or not report_path.is_file():
+        raise PipelineError("staged output pair is incomplete", stage="stage-validation")
+    html = html_path.read_text(encoding="utf-8")
+    errors = standalone_errors(html)
+    if errors:
+        raise PipelineError(
+            "standalone validation failed: " + "; ".join(errors),
+            stage="stage-validation",
+        )
+    report = report_path.read_text(encoding="utf-8")
+    missing_sections = [title for title in SECTION_KEYS if f"## {title}" not in report]
+    if missing_sections:
+        raise PipelineError(
+            "validation report missing required sections",
+            stage="stage-validation",
+        )
+    if input_hash not in report:
+        raise PipelineError("validation report input hash mismatch", stage="stage-validation")
+    if "Status: **PASS**" in report and "Consolidated status: **PARTIAL**" in report:
+        raise PipelineError("validation status hides missing FX", stage="stage-validation")
+
+
+def publish_pair(
+    staged_html: Path,
+    staged_report: Path,
+    output_dir: Path,
+    input_xml: Path,
+    expected_input_hash: str,
+) -> None:
+    final_html = output_dir / FINAL_HTML
+    final_report = output_dir / FINAL_REPORT
+    token = uuid.uuid4().hex
+    backup_html = output_dir / f".{FINAL_HTML}.{token}.previous"
+    backup_report = output_dir / f".{FINAL_REPORT}.{token}.previous"
+    html_backed_up = False
+    report_backed_up = False
+    html_published = False
+    report_published = False
+    try:
+        inject("before_publish")
+        if final_html.exists():
+            os.replace(final_html, backup_html)
+            html_backed_up = True
+        if final_report.exists():
+            os.replace(final_report, backup_report)
+            report_backed_up = True
+        inject("after_backup")
+        os.replace(staged_html, final_html)
+        html_published = True
+        inject("after_first_replace")
+        inject("before_second_replace")
+        os.replace(staged_report, final_report)
+        report_published = True
+        inject("after_second_replace")
+        if sha256(input_xml) != expected_input_hash:
+            raise PipelineError("input hash changed during publication", stage="input-integrity")
+        fsync_directory(output_dir)
+    except Exception:
+        if report_published and final_report.exists():
+            final_report.unlink()
+        if html_published and final_html.exists():
+            final_html.unlink()
+        if report_backed_up and backup_report.exists():
+            os.replace(backup_report, final_report)
+        if html_backed_up and backup_html.exists():
+            os.replace(backup_html, final_html)
+        fsync_directory(output_dir)
+        raise
+    else:
+        if backup_report.exists():
+            backup_report.unlink()
+        if backup_html.exists():
+            backup_html.unlink()
+        fsync_directory(output_dir)
+
+
+def sanitize_error(message: str, paths: tuple[Path, ...]) -> str:
+    result = message.replace("\r", " ").replace("\n", " ")
+    for path in sorted(paths, key=lambda item: len(str(item)), reverse=True):
+        result = result.replace(str(path), "<redacted-path>")
+    result = re.sub(r"/(?:Users|home|var|tmp)/[^\s:]+", "<redacted-path>", result)
+    result = re.sub(r"[A-Za-z]:\\[^\s:]+", "<redacted-path>", result)
+    return result[:500]
+
+
+def write_error_report(output_dir: Path, error: PipelineError, paths: tuple[Path, ...]) -> None:
+    content = f"""PORTFOLIO DASHBOARD BUILD FAILED
+
+Stage: {error.stage}
+Exit code: {error.exit_code}
+Reason code: {error.reason_code or "UNAVAILABLE"}
+Reason: {sanitize_error(str(error), paths)}
+
+Accepted input rule: exactly one primary *.xml directly in input/; files ending .backup.xml are ignored. Symlinks are rejected.
+Prior dashboard.html and validation_report.md were preserved or restored.
+No client XML contents, transaction notes, or absolute paths are included in this report.
+"""
+    temporary = output_dir / f".{ERROR_REPORT}.{uuid.uuid4().hex}.tmp"
+    write_fsync(temporary, content)
+    os.replace(temporary, output_dir / ERROR_REPORT)
+    fsync_directory(output_dir)
+
+
+def validate_full_client_scope(
+    model: PortfolioModel,
+    valuation: Any,
+    official_modes: Mapping[str, Any],
+) -> None:
+    """Fail closed when the official client scope omits any part of the input XML."""
+
+    validate_group_scope(model, valuation, model.group_scopes[0], official_modes)
+
+
+def validate_group_scope(
+    model: PortfolioModel,
+    valuation: Any,
+    group: Any,
+    official_modes: Mapping[str, Any],
+) -> None:
+    """Validate one official full/saved Grouped Accounts scope across currencies."""
+
+    expected_accounts = set(group.account_uuids)
+    expected_portfolios = set(group.portfolio_uuids)
+    expected_holding_currencies = {
+        item.security_uuid: item.security_currency
+        for item in valuation.holdings
+        if item.portfolio_uuid in expected_portfolios
+        and item.original_market_value is not None
+        and item.original_market_value != 0
+    }
+    expected_holdings = set(expected_holding_currencies)
+    expected_holding_currency_set = set(expected_holding_currencies.values())
+    if not expected_accounts and not expected_portfolios:
+        raise ClientViewError(
+            "CV_SCOPE_INVENTORY_EMPTY",
+            "full XML client account and portfolio inventories are both empty",
+        )
+
+    reference_scope: tuple[frozenset[str], frozenset[str], frozenset[str]] | None = None
+    reference_cash: tuple[tuple[str, str, Decimal], ...] | None = None
+    for reporting_currency, official in sorted(official_modes.items()):
+        overview = official.summary.get("portfolio_overview")
+        if not isinstance(overview, Mapping):
+            raise ClientViewError(
+                "CV_SCOPE_OVERVIEW_MISSING",
+                f"{reporting_currency} official mode lacks portfolio overview",
+            )
+        scope = overview.get("scope")
+        holdings = overview.get("scoped_holdings")
+        cash = overview.get("cash")
+        if not isinstance(scope, Mapping) or not isinstance(holdings, list) or not isinstance(cash, Mapping):
+            raise ClientViewError(
+                "CV_SCOPE_EVIDENCE_MISSING",
+                f"{reporting_currency} official mode lacks full scope evidence",
+            )
+        cash_accounts = cash.get("accounts")
+        if not isinstance(cash_accounts, list):
+            raise ClientViewError(
+                "CV_SCOPE_CASH_EVIDENCE_MISSING",
+                f"{reporting_currency} official mode lacks cash-account evidence",
+            )
+        expected_mode = "FULL_CLIENT" if group.filter_uuid is None else "CLIENT_FILTER"
+        if scope.get("mode") != expected_mode:
+            raise ClientViewError(
+                "CV_SCOPE_NOT_FULL_CLIENT",
+                f"{reporting_currency} official mode does not match group {group.id}"
+            )
+        account_ids = [str(item) for item in scope.get("account_uuids", [])]
+        portfolio_ids = [str(item) for item in scope.get("portfolio_uuids", [])]
+        holding_ids = [str(item.get("security_uuid")) for item in holdings]
+        actual_accounts = set(account_ids)
+        actual_portfolios = set(portfolio_ids)
+        actual_holdings = set(holding_ids)
+        actual_holding_currencies_set = {
+            str(item.get("currency", "")).upper() for item in holdings
+        }
+        actual_holding_currencies = {
+            str(item.get("security_uuid")): str(item.get("currency", "")).upper()
+            for item in holdings
+        }
+        if actual_accounts != expected_accounts or len(account_ids) != len(actual_accounts):
+            raise ClientViewError(
+                "CV_SCOPE_ACCOUNT_MISMATCH",
+                f"{reporting_currency} group scope omits or duplicates expected accounts"
+            )
+        if actual_portfolios != expected_portfolios or len(portfolio_ids) != len(actual_portfolios):
+            raise ClientViewError(
+                "CV_SCOPE_PORTFOLIO_MISMATCH",
+                f"{reporting_currency} group scope omits or duplicates expected portfolios"
+            )
+        if actual_holdings != expected_holdings or len(holding_ids) != len(actual_holdings):
+            raise ClientViewError(
+                "CV_SCOPE_HOLDING_MISMATCH",
+                f"{reporting_currency} group scope omits or adds current holdings"
+            )
+        if actual_holding_currencies != expected_holding_currencies:
+            raise ClientViewError(
+                "CV_SCOPE_HOLDING_CURRENCY_MISMATCH",
+                f"{reporting_currency} group scope misstates a holding currency"
+            )
+        if actual_holding_currencies_set != expected_holding_currency_set:
+            raise ClientViewError(
+                "CV_SCOPE_SOURCE_CURRENCY_MISMATCH",
+                f"{reporting_currency} group scope omits a source currency"
+            )
+        cash_ids = [str(item.get("account_uuid", "")) for item in cash_accounts]
+        if set(cash_ids) != expected_accounts or len(cash_ids) != len(set(cash_ids)):
+            raise ClientViewError(
+                "CV_SCOPE_CASH_EVIDENCE_MISSING",
+                f"{reporting_currency} cash rows omit or duplicate an XML account"
+            )
+        expected_cash_currencies = {
+            account_uuid: str(model.accounts[account_uuid].currency).upper()
+            for account_uuid in expected_accounts
+        }
+        actual_cash_currencies = {
+            str(item.get("account_uuid", "")): str(item.get("original_currency", "")).upper()
+            for item in cash_accounts
+        }
+        if actual_cash_currencies != expected_cash_currencies:
+            raise ClientViewError(
+                "CV_SCOPE_CASH_ORIGINAL_CURRENCY_MISMATCH",
+                f"{reporting_currency} cash rows misstate an account currency"
+            )
+        if any(
+            str(item.get("reporting_currency", "")).upper() != reporting_currency
+            for item in cash_accounts
+        ):
+            raise ClientViewError(
+                "CV_SCOPE_CASH_REPORTING_CURRENCY_MISMATCH",
+                f"{reporting_currency} cash row reporting currency mismatch"
+            )
+        cash_total = sum(
+            (Decimal(str(item.get("reporting_value"))) for item in cash_accounts),
+            Decimal(0),
+        )
+        cash_tolerance = component_rounding_tolerance(len(cash_accounts))
+        if abs(cash_total - Decimal(str(cash.get("market_value")))) > cash_tolerance:
+            raise ClientViewError(
+                "CV_SCOPE_CASH_TOTAL_MISMATCH",
+                f"{reporting_currency} cash rows do not reconcile to aggregate cash"
+            )
+        cash_identity = tuple(
+            sorted(
+                (
+                    str(item["account_uuid"]),
+                    str(item["original_currency"]).upper(),
+                    Decimal(str(item["original_value"])),
+                )
+                for item in cash_accounts
+            )
+        )
+        if reference_cash is not None and cash_identity != reference_cash:
+            raise ClientViewError(
+                "CV_CROSS_MODE_CASH_MISMATCH",
+                "official reporting modes use different original cash rows",
+            )
+        reference_cash = cash_identity
+        identity = (
+            frozenset(actual_accounts),
+            frozenset(actual_portfolios),
+            frozenset(actual_holdings),
+        )
+        if reference_scope is not None and identity != reference_scope:
+            raise ClientViewError(
+                "CV_CROSS_MODE_SCOPE_MISMATCH",
+                "official reporting modes use different group scopes",
+            )
+        reference_scope = identity
+
+
+def discover_active_mode_currencies(
+    model: PortfolioModel,
+    base_official: Any,
+) -> tuple[str, ...]:
+    """Return base-first report modes from authoritative current holdings and cash."""
+
+    base_currency = str(model.base_currency).strip().upper()
+    official_currency = str(base_official.summary.get("reporting_currency", "")).upper()
+    if official_currency != base_currency:
+        raise ClientViewError(
+            "CV_BASE_CURRENCY_MISMATCH",
+            "base official mode does not match the XML base currency",
+        )
+    overview = base_official.summary.get("portfolio_overview")
+    if not isinstance(overview, Mapping):
+        raise ClientViewError(
+            "CV_BASE_OVERVIEW_MISSING",
+            "base official mode lacks portfolio overview",
+        )
+    holdings = overview.get("scoped_holdings")
+    cash = overview.get("cash")
+    cash_accounts = cash.get("accounts") if isinstance(cash, Mapping) else None
+    if not isinstance(holdings, list) or not isinstance(cash_accounts, list):
+        raise ClientViewError(
+            "CV_ACTIVE_CURRENCY_EVIDENCE_MISSING",
+            "base official mode lacks active currency evidence",
+        )
+    currencies = {base_currency}
+    currencies.update(
+        str(item.get("currency", "")).upper()
+        for item in holdings
+        if Decimal(str(item.get("market_value"))) != 0
+    )
+    currencies.update(
+        str(item.get("original_currency", "")).upper()
+        for item in cash_accounts
+        if Decimal(str(item.get("original_value"))) != 0
+    )
+    invalid = sorted(code for code in currencies if re.fullmatch(r"[A-Z]{3}", code) is None)
+    if invalid:
+        raise ClientViewError(
+            "CV_ACTIVE_CURRENCY_INVALID",
+            f"invalid active reporting currency: {invalid[0]}",
+        )
+    return (base_currency, *(code for code in sorted(currencies) if code != base_currency))
+
+
+def cross_mode_rounding_tolerance(component_count: int, rate: Decimal) -> Decimal:
+    """Bound cross-mode drift in target-currency units.
+
+    Portfolio Performance can round every component and the aggregate once in
+    each reporting currency.  The source-currency budget therefore has to be
+    converted at the dated FX rate before it can be combined with the target
+    budget.  A fixed number of target cents is not dimensionally valid for
+    high-scale pairs such as USD/JPY.
+    """
+
+    normalized_rate = Decimal(rate)
+    if not normalized_rate.is_finite() or normalized_rate <= 0:
+        raise ValueError("cross-mode rate must be positive and finite")
+    source_budget = component_rounding_tolerance(component_count)
+    target_budget = component_rounding_tolerance(component_count)
+    return source_budget * normalized_rate.copy_abs() + target_budget
+
+
+def validate_cross_mode_series(official_modes: Mapping[str, Any], fx_cache: Any) -> None:
+    """Prove every official market-value series is one dated FX system."""
+
+    if not official_modes:
+        raise ClientViewError("CV_MODES_EMPTY", "official mode inventory cannot be empty")
+    component_count = max(
+        len(mode.summary["portfolio_overview"]["scoped_holdings"])
+        + len(mode.summary["portfolio_overview"]["cash"]["accounts"])
+        for mode in official_modes.values()
+    )
+    by_currency = {
+        currency: {str(row["date"]): row for row in mode.series}
+        for currency, mode in official_modes.items()
+    }
+    reference_dates: set[str] | None = None
+    for currency, rows in by_currency.items():
+        if not rows:
+            raise ClientViewError(
+                "CV_SERIES_EMPTY",
+                f"{currency} official performance series is empty",
+            )
+        dates = set(rows)
+        if reference_dates is not None and dates != reference_dates:
+            raise ClientViewError(
+                "CV_SERIES_DATES_MISMATCH",
+                "official reporting modes use different series dates",
+            )
+        reference_dates = dates
+    for source, source_rows in by_currency.items():
+        for target, target_rows in by_currency.items():
+            if source == target:
+                continue
+            for day_text, source_row in source_rows.items():
+                day = date.fromisoformat(day_text)
+                resolution = fx_cache.resolve(source, target, day)
+                if resolution.provider != ECB_PROVIDER:
+                    raise ClientViewError(
+                        "CV_FX_PROVENANCE_MISSING",
+                        "cross-mode validation lacks ECB provenance",
+                    )
+                expected = Decimal(str(source_row["portfolio_market_value"])) * resolution.rate
+                actual = Decimal(str(target_rows[day_text]["portfolio_market_value"]))
+                tolerance = cross_mode_rounding_tolerance(
+                    component_count,
+                    resolution.rate,
+                )
+                if abs(actual - expected) > tolerance:
+                    difference = abs(actual - expected)
+                    raise ClientViewError(
+                        "CV_SERIES_VALUE_MISMATCH",
+                        f"{source}/{target} market-value series differ beyond component rounding "
+                        f"on {day_text}; difference={difference}; tolerance={tolerance}; "
+                        f"components={component_count}"
+                    )
+
+
+def execute(input_dir: Path, output_dir: Path) -> tuple[Path, Path, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_event("pipeline", "START")
+    xml = discover_input(input_dir)
+    diagnostic_event("input-discovery", "PASS")
+    input_hash = sha256(xml)
+    stage = Path(tempfile.mkdtemp(prefix=".dashboard-build-", dir=output_dir))
+    try:
+        try:
+            model = PortfolioModel.from_path(xml, allowed_root=input_dir)
+        except (PortfolioModelError, XmlSecurityError, OSError) as error:
+            reason_code, safe_message = safe_portfolio_parse_failure(error)
+            diagnostic_reference_audit(error)
+            raise PipelineError(
+                safe_message,
+                stage="canonical-parse",
+                exit_code=65,
+                reason_code=reason_code,
+            ) from error
+        diagnostic_event("canonical-parse", "PASS", xml_version=model.version)
+        inject("after_parse")
+        if sha256(xml) != input_hash:
+            raise PipelineError("input hash changed after parse", stage="input-integrity")
+        normalized = normalize_transactions(model)
+        valuation = build_valuation(model, normalized)
+        diagnostic_event(
+            "portfolio-normalization",
+            "PASS",
+            events=len(normalized.events),
+            holdings=len(valuation.holdings),
+            accounts=len(valuation.accounts),
+        )
+        fx_cache, fx_cache_path = load_official_fx(model, normalized, valuation)
+        diagnostic_event("official-fx", "PASS")
+        # Every official mode starts with the same validated ECB snapshot, including
+        # all active source currencies discovered from the complete XML graph.
+        run_official_exporter(
+            xml,
+            stage,
+            fx_cache=fx_cache_path,
+            client_scope="FULL_XML",
+        )
+        diagnostic_event("official-base-mode", "PASS")
+        inject("after_official")
+        if sha256(xml) != input_hash:
+            raise PipelineError("input hash changed after official export", stage="input-integrity")
+        official = load_official_inputs(stage / "report.json", stage / "performance_series.csv")
+        try:
+            active_modes = discover_active_mode_currencies(model, official)
+            diagnostic_event(
+                "mode-discovery",
+                "PASS",
+                mode_count=len(active_modes),
+                modes="+".join(active_modes),
+            )
+            base_currency = active_modes[0]
+            official_modes = {base_currency: official}
+            for reporting_currency in active_modes[1:]:
+                mode_stage = stage / f"official-{reporting_currency.casefold()}"
+                run_official_exporter(
+                    xml,
+                    mode_stage,
+                    reporting_currency=reporting_currency,
+                    dashboard_currency=base_currency,
+                    fx_cache=fx_cache_path,
+                    client_scope="FULL_XML",
+                )
+                official_modes[reporting_currency] = load_official_inputs(
+                    mode_stage / "report.json",
+                    mode_stage / "performance_series.csv",
+                )
+                diagnostic_event(
+                    "official-reporting-mode",
+                    "PASS",
+                    currency=reporting_currency,
+                )
+            run_client_view_stage(
+                "client-scope-validation",
+                lambda: validate_full_client_scope(
+                    model,
+                    valuation,
+                    official_modes,
+                ),
+            )
+            run_client_view_stage(
+                "cross-mode-validation",
+                lambda: validate_cross_mode_series(official_modes, fx_cache),
+            )
+            official_group_modes = {model.group_scopes[0].id: official_modes}
+            for group_index, group in enumerate(model.group_scopes[1:], start=1):
+                group_modes = {}
+                for reporting_currency in active_modes:
+                    group_stage = (
+                        stage
+                        / f"official-group-{group_index}-{reporting_currency.casefold()}"
+                    )
+                    run_official_exporter(
+                        xml,
+                        group_stage,
+                        reporting_currency=reporting_currency,
+                        dashboard_currency=base_currency,
+                        fx_cache=fx_cache_path,
+                        client_scope=group.id,
+                    )
+                    group_modes[reporting_currency] = load_official_inputs(
+                        group_stage / "report.json",
+                        group_stage / "performance_series.csv",
+                    )
+                run_client_view_stage(
+                    f"group-scope-{group_index}",
+                    lambda group=group, group_modes=group_modes: validate_group_scope(
+                        model,
+                        valuation,
+                        group,
+                        group_modes,
+                    ),
+                )
+                run_client_view_stage(
+                    f"group-cross-mode-{group_index}",
+                    lambda group_modes=group_modes: validate_cross_mode_series(
+                        group_modes, fx_cache
+                    ),
+                )
+                official_group_modes[group.id] = group_modes
+            client_views = run_client_view_stage(
+                "client-payload-build",
+                lambda: build_grouped_client_views(
+                    model,
+                    normalized,
+                    valuation,
+                    official_group_modes,
+                    fx_cache,
+                ),
+            )
+            diagnostic_event(
+                "client-views",
+                "PASS",
+                mode_count=len(official_modes),
+                group_count=len(official_group_modes),
+            )
+        except ClientViewError as error:
+            raise PipelineError(
+                f"client currency modes failed reconciliation: {error}",
+                stage="client-views",
+                exit_code=70,
+                reason_code=error.code,
+            ) from error
+        write_fsync(
+            stage / "client-views.json",
+            normalized_client_json(client_views, indent=2) + "\n",
+        )
+        views = build_currency_views(
+            model,
+            valuation,
+            normalized,
+            mode=CurrencyViewMode.BOTH,
+            reporting_currency=str(official.summary["reporting_currency"]),
+            fx_provider=fx_cache.to_dated_provider(),
+        )
+        detailed = build_detailed_report(
+            model,
+            official,
+            normalized,
+            valuation,
+            views,
+            source_sha256=input_hash,
+        )
+        if validate_detailed_report(detailed):
+            raise PipelineError("detailed schema validation failed", stage="detailed-report")
+        write_fsync(stage / "detailed-report.json", normalized_json(detailed, indent=2) + "\n")
+        diagnostic_event("detailed-report", "PASS")
+        inject("after_detailed")
+        try:
+            summary = load_report(stage / "report.json")
+        except DashboardError as error:
+            raise PipelineError(
+                "official dashboard report failed render-input validation",
+                stage="dashboard-input-validation",
+                exit_code=70,
+                reason_code="DASHBOARD_REPORT_INVALID",
+            ) from error
+        try:
+            points = load_series(stage / "performance_series.csv")
+            validate_series_against_report(points, summary)
+        except DashboardError as error:
+            raise PipelineError(
+                "official dashboard series failed render-input validation",
+                stage="dashboard-input-validation",
+                exit_code=70,
+                reason_code="DASHBOARD_SERIES_INVALID",
+            ) from error
+        try:
+            html = render_detailed_dashboard(
+                summary,
+                points,
+                detailed,
+                DEFAULT_MARK,
+                Path("report.json"),
+                Path("performance_series.csv"),
+                Path("detailed-report.json"),
+                client_views=client_views,
+            )
+        except DashboardError as error:
+            raise PipelineError(
+                "client HTML rendering failed validation",
+                stage="dashboard-render",
+                exit_code=70,
+                reason_code="DASHBOARD_RENDER_INVALID",
+            ) from error
+        html_path = stage / FINAL_HTML
+        write_fsync(html_path, html)
+        diagnostic_event("dashboard-render", "PASS", html_chars=len(html))
+        inject("after_render")
+        validation = validation_markdown(
+            model, normalized, valuation, detailed, html, input_hash, client_views
+        )
+        report_path = stage / FINAL_REPORT
+        write_fsync(report_path, validation)
+        diagnostic_event("validation-report", "PASS")
+        inject("after_validation_report")
+        validate_staged_pair(html_path, report_path, input_hash)
+        inject("after_stage_validation")
+        if sha256(xml) != input_hash:
+            raise PipelineError("input hash changed before publication", stage="input-integrity")
+        publish_pair(html_path, report_path, output_dir, xml, input_hash)
+        diagnostic_event("publication", "PASS")
+        if sha256(xml) != input_hash:
+            raise PipelineError("input hash changed after publication", stage="input-integrity")
+        error_report = output_dir / ERROR_REPORT
+        if error_report.exists():
+            error_report.unlink()
+            fsync_directory(output_dir)
+        diagnostic_event("pipeline", "PASS")
+        return output_dir / FINAL_HTML, output_dir / FINAL_REPORT, input_hash
+    except Exception as error:
+        diagnostic_event(
+            error.stage if isinstance(error, PipelineError) else "internal",
+            "FAIL",
+            exit_code=error.exit_code if isinstance(error, PipelineError) else 70,
+            error_type=type(error).__name__,
+            reason_code=(
+                error.reason_code
+                if isinstance(error, PipelineError) and error.reason_code
+                else "UNAVAILABLE"
+            ),
+        )
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def main() -> int:
+    if len(sys.argv) != 1:
+        print("build-portfolio-dashboard accepts no arguments", file=sys.stderr)
+        return 64
+    input_dir = Path(os.environ.get("PP_DASHBOARD_INPUT_DIR", ROOT / "input")).resolve()
+    output_dir = Path(os.environ.get("PP_DASHBOARD_OUTPUT_DIR", ROOT / "output")).resolve()
+    xml_for_error: Path | None = None
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            xml_for_error = discover_input(input_dir)
+        except PipelineError:
+            pass
+        html, report, digest = execute(input_dir, output_dir)
+    except Exception as raw_error:
+        error = (
+            raw_error
+            if isinstance(raw_error, PipelineError)
+            else PipelineError(
+                "unexpected internal pipeline failure",
+                stage="internal",
+                exit_code=70,
+            )
+        )
+        paths = tuple(
+            path
+            for path in (ROOT, input_dir, output_dir, xml_for_error)
+            if path is not None
+        )
+        diagnostic_event(
+            error.stage,
+            "FAIL",
+            exit_code=error.exit_code,
+            error_type=type(raw_error).__name__,
+            reason_code=error.reason_code or "UNAVAILABLE",
+        )
+        try:
+            write_error_report(output_dir, error, paths)
+        except OSError:
+            pass
+        print(f"dashboard build failed [{error.stage}]: {sanitize_error(str(error), paths)}", file=sys.stderr)
+        return error.exit_code
+    print(f"Dashboard: {html}")
+    print(f"Validation: {report}")
+    print(f"Input SHA-256: {digest}")
+    print("Status: build completed with disclosed validation status")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

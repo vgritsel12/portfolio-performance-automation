@@ -1,0 +1,2 @@
+# Runtime: Python standard library only.
+# Full metrics workflow additionally requires Java 21 and Maven; see README.
